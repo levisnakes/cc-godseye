@@ -1,0 +1,1907 @@
+--[[
+  GOD'S EYE  //  base intrusion logger  v2
+  CC:Tweaked + Create: Radars + Advanced Peripherals Player Detector
+
+  Logs everyone who comes near your base: who, when they arrived (Mountain
+  Time), when they left, how long they stayed, how close they got and from
+  which direction. Sends an hourly report (and instant alerts) to Discord.
+
+  Commands:
+    godseye          run the system
+    godseye probe    list peripherals + dump what the radar/detector return
+    godseye test     send a test message to your Discord webhook
+
+  Tip: rename this file to startup.lua so it starts on its own.
+]]
+
+------------------------------------------------------------------
+-- CONFIG  (edit these)
+------------------------------------------------------------------
+local CFG = {
+  baseName      = "Arstotzka",
+  baseX         = 2702,       -- centre of your base (F3 while standing there)
+  baseY         = 85,
+  baseZ         = 10,
+  radius        = 128,     -- blocks from centre that count as "near"
+
+  -- people
+  ignore        = {        -- never logged at all
+    ["That_guy_luxe"] = true,
+    -- ["AnotherName"] = true,
+  },
+  friends       = {        -- starting whitelist (you can also tap people on the monitor)
+    -- ["BuddyName"] = true,
+  },
+  blacklist     = {        -- starting blacklist (you can also tap people on the monitor)
+    -- ["Griefer123"] = true,
+  },
+  blackPing     = "@here", -- ping used when a BLACKLISTED player shows up
+  onlyPlayers   = true,    -- ignore mobs/contraptions on the radar
+
+  -- time (Mountain Time, daylight saving handled automatically)
+  utcOffset     = -7,      -- MST. -6 Central, -5 Eastern, -8 Pacific
+  useDST        = true,
+  tzLabel       = "MT",
+  clock12       = true,    -- 10:41 PM instead of 22:41
+
+  -- Discord
+  webhookUrl    = "",      -- paste your webhook URL between the quotes
+  reportMinutes = 60,      -- report sent on the hour, every N minutes
+  instantAlerts = true,    -- also post the moment a non-friend arrives
+  alertPing     = "",      -- e.g. "@here" or "<@YOUR_USER_ID>" (blank = no ping)
+  alertCooldown = 300,     -- seconds before the same person can alert again
+  quietReports  = false,   -- true = skip hourly reports when nobody came
+
+  -- Discord BOT (adds Whitelist / Blacklist / Ignore buttons)
+  -- Needs discord.lua + a file named discord.token (your bot token) on this computer.
+  -- When the bot is set up, alerts/reports go through the bot instead of the webhook.
+  botChannel    = "1558706718958161951",  -- channel ID (Developer Mode > right-click channel > Copy ID)
+  botAdmins     = {        -- Discord user IDs allowed to press the buttons
+    -- ["123456789012345678"] = true,
+  },
+  botAdminRole  = "",      -- or: a role ID whose members may press them
+
+  -- behaviour
+  leaveAfter    = 15,      -- seconds unseen before a visit is closed
+  pollEvery     = 1,
+  logFile       = "godseye.dat",
+  maxLog        = 300,
+
+  -- hardware (leave nil to auto-detect)
+  monitorName   = nil,
+  radarName     = nil,
+  detectorName  = nil,     -- e.g. "player_detector_3"
+  textScale     = 0.5,
+  alarmSide     = nil,     -- e.g. "back": redstone ON while an intruder is near
+
+  -- HUD feed (for the smart glasses / any other computer on the team)
+  hudChannel    = 4242,    -- wireless/ender modem channel the state is broadcast on (nil = off)
+  hudModem      = nil,     -- modem name; nil = first wireless modem found
+  breachRadius  = 40,      -- blocks from centre that count as a BREACH (inside "radius" = CONTACT)
+  linkGrace     = 30,      -- seconds to keep visits open while the detector is unplugged
+
+  -- remote injection (a pocket computer running remote_injector.lua reports players by hand)
+  remoteChannel = 4245,    -- modem channel to listen on (nil = off)
+  remoteKey     = "",      -- shared password; must match the pocket's KEY ("" = accept anyone)
+  remoteTTL     = 30,      -- seconds an injected player stays "seen" after the last packet
+
+  -- base alert level (1 = WAR ... 5 = PEACE), changed on the monitor or in Discord
+  startLevel    = 4,
+
+  -- top-down radar page (CC DirectGPU block next to the monitor)
+  gpuName       = nil,     -- nil = auto-detect
+  gpuRes        = nil,     -- resolution multiplier (nil = mod default; try 2 for sharper)
+  radarRange    = nil,     -- blocks from centre to edge of the scope (nil = radius x 1.5)
+  radarFps      = 10,      -- redraws per second (DirectGPU can do up to ~20)
+  sweepSpeed    = 1.6,     -- radar beam speed (radians per second)
+  radarShowShips = true,   -- show ships/contraptions as grey markers
+  radarFont     = "Monospaced",
+
+  -- live website (Firebase Realtime Database relay; see SETUP.md)
+  firebaseUrl   = "",      -- e.g. "https://godseye-1234-default-rtdb.firebaseio.com"
+  firebaseKey   = "",      -- your secret base key (20+ random letters/numbers)
+  webEvery      = 2,       -- seconds between website updates
+  webLogSize    = 40,      -- log entries sent to the website
+}
+
+-- Your own settings live in godseye.cfg so updating this file never wipes them.
+-- Anything in godseye.cfg overrides the defaults above.
+do
+  -- reads <program name>.cfg (e.g. godseyeDGPU.cfg), falling back to godseye.cfg
+  local prog = shell and shell.getRunningProgram() or "godseye.lua"
+  local dir = fs.getDir(prog)
+  local base = fs.getName(prog):gsub("%.lua$", "")
+  local path = fs.combine(dir, base .. ".cfg")
+  if not fs.exists(path) then path = fs.combine(dir, "godseye.cfg") end
+  if not fs.exists(path) then path = fs.combine(dir, "godseyeDGPU.cfg") end
+  if fs.exists(path) then
+    local fn, err = loadfile(path, nil, {})
+    local ok, user = false, nil
+    if fn then ok, user = pcall(fn) end
+    if ok and type(user) == "table" then
+      for k, v in pairs(user) do CFG[k] = v end
+    else
+      printError("godseye.cfg has an error: " .. tostring(err or user))
+      sleep(3)
+    end
+  end
+end
+
+------------------------------------------------------------------
+-- PERIPHERALS
+------------------------------------------------------------------
+local function lower(s) return type(s) == "string" and s:lower() or "" end
+
+local function findRadar()
+  if CFG.radarName then return peripheral.wrap(CFG.radarName), CFG.radarName end
+  for _, n in ipairs(peripheral.getNames()) do
+    local t = lower(peripheral.getType(n))
+    if t:find("radar") or t:find("filterer") or t:find("trunk") then
+      return peripheral.wrap(n), n
+    end
+  end
+end
+
+local function findDetector()
+  if CFG.detectorName then return peripheral.wrap(CFG.detectorName), CFG.detectorName end
+  for _, n in ipairs(peripheral.getNames()) do
+    local types = { peripheral.getType(n) }
+    types[#types + 1] = n
+    for _, t in ipairs(types) do
+      if lower(t):gsub("[_%s:]", ""):find("playerdetector") then
+        return peripheral.wrap(n), n
+      end
+    end
+  end
+end
+
+-- a real monitor reports its size; skip the GPU block (it can show up as a "monitor" too)
+local function realMonitor(name, m)
+  if name:lower():find("gpu") or not m.getSize then return false end
+  local ok, w, h = pcall(m.getSize)
+  return ok and type(w) == "number" and type(h) == "number"
+end
+local mon = CFG.monitorName and peripheral.wrap(CFG.monitorName)
+            or peripheral.find("monitor", realMonitor) or term.current()
+local radar, radarName = findRadar()
+local detector, detectorName = findDetector()
+local speaker = peripheral.find("speaker")
+
+local function findGpu()
+  if CFG.gpuName then return peripheral.wrap(CFG.gpuName), CFG.gpuName end
+  for _, n in ipairs(peripheral.getNames()) do
+    local t = lower(peripheral.getType(n))
+    if t:find("gpu") or n:lower():find("gpu") then return peripheral.wrap(n), n end
+  end
+end
+local gpu, gpuName = findGpu()
+if gpu then pcall(gpu.clearAllDisplays) end   -- remove leftovers from a crash
+
+-- Discord bot (optional): discord.lua next to this program
+local discord, bot
+do
+  local ok, lib = pcall(require, "discord")
+  if ok and type(lib) == "table" then
+    discord = lib
+    bot = lib.new({ name = "godseye" })
+    if not bot:hasToken() then bot = nil end
+  end
+end
+local function botOn() return bot ~= nil and CFG.botChannel ~= "" end
+
+------------------------------------------------------------------
+-- TIME  (UTC -> Mountain Time with US daylight saving)
+------------------------------------------------------------------
+local function nowMs()  return os.epoch("utc") end
+local function nowSec() return math.floor(os.epoch("utc") / 1000) end
+
+local function daysFromCivil(y, m, d)
+  if m <= 2 then y = y - 1 end
+  local era = math.floor(y / 400)
+  local yoe = y - era * 400
+  local doy = math.floor((153 * ((m + 9) % 12) + 2) / 5) + d - 1
+  local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+  return era * 146097 + doe - 719468
+end
+
+local function nthSunday(y, m, n)          -- day number (since 1970) of nth Sunday
+  local d1 = daysFromCivil(y, m, 1)
+  local wd = (d1 + 4) % 7                  -- 0 = Sunday
+  return d1 + (7 - wd) % 7 + (n - 1) * 7
+end
+
+local function civil(sec)                  -- UTC seconds -> y,m,d,h,mi,s (no os.date needed)
+  local days = math.floor(sec / 86400)
+  local rem  = sec - days * 86400
+  local z = days + 719468
+  local era = math.floor(z / 146097)
+  local doe = z - era * 146097
+  local yoe = math.floor((doe - math.floor(doe / 1460) + math.floor(doe / 36524) - math.floor(doe / 146096)) / 365)
+  local y = yoe + era * 400
+  local doy = doe - (365 * yoe + math.floor(yoe / 4) - math.floor(yoe / 100))
+  local mp = math.floor((5 * doy + 2) / 153)
+  local d = doy - math.floor((153 * mp + 2) / 5) + 1
+  local m = mp < 10 and mp + 3 or mp - 9
+  if m <= 2 then y = y + 1 end
+  return y, m, d, math.floor(rem / 3600), math.floor(rem % 3600 / 60), rem % 60
+end
+
+local function offsetHours(utc)
+  local off = CFG.utcOffset
+  if CFG.useDST then
+    local y = civil(utc)
+    local start = nthSunday(y, 3, 2) * 86400 + (2 - CFG.utcOffset) * 3600        -- 2am std
+    local stop  = nthSunday(y, 11, 1) * 86400 + (2 - (CFG.utcOffset + 1)) * 3600 -- 2am DST
+    if utc >= start and utc < stop then off = off + 1 end
+  end
+  return off
+end
+
+local function localSec(utc) utc = utc or nowSec() return utc + offsetHours(utc) * 3600 end
+
+-- fmtT(utc, {date=true, secs=true})
+local function fmtT(utc, o)
+  o = o or {}
+  local _, mo, d, h, mi, s = civil(localSec(utc))
+  local out
+  if CFG.clock12 then
+    local ap = h >= 12 and "PM" or "AM"
+    local h12 = h % 12 if h12 == 0 then h12 = 12 end
+    out = o.secs and ("%d:%02d:%02d %s"):format(h12, mi, s, ap) or ("%d:%02d %s"):format(h12, mi, ap)
+  else
+    out = o.secs and ("%02d:%02d:%02d"):format(h, mi, s) or ("%02d:%02d"):format(h, mi)
+  end
+  if o.date then out = ("%d/%d "):format(mo, d) .. out end
+  return out
+end
+
+local function isoUTC(utc)
+  local y, mo, d, h, mi, s = civil(utc)
+  return ("%04d-%02d-%02dT%02d:%02d:%02dZ"):format(y, mo, d, h, mi, s)
+end
+
+local function gameStamp()
+  return ("D%d %s"):format(os.day(), textutils.formatTime(os.time(), true))
+end
+
+local function fmtDur(s)
+  s = math.floor(s or 0)
+  if s < 60 then return s .. "s" end
+  if s < 3600 then return ("%dm%02ds"):format(math.floor(s / 60), s % 60) end
+  return ("%dh%02dm"):format(math.floor(s / 3600), math.floor(s % 3600 / 60))
+end
+
+local atan2 = math.atan2 or math.atan
+local DIRS = { "N", "NE", "E", "SE", "S", "SW", "W", "NW" }
+local function compass(x, z)
+  if not x then return "" end
+  local dx, dz = x - CFG.baseX, z - CFG.baseZ
+  if dx * dx + dz * dz < 4 then return "" end
+  local a = math.deg(atan2(dx, -dz)) % 360
+  return DIRS[math.floor((a + 22.5) / 45) % 8 + 1]
+end
+
+------------------------------------------------------------------
+-- STORAGE
+------------------------------------------------------------------
+local log, active, known = {}, {}, {}
+local lists = {}          -- lists[name] = "white" | "black"   (set from the monitor)
+local state = { lastReportT = nil, lastReportKey = nil }
+local lastErr = nil
+local webStatus = "off"      -- live website link: "off" / "online" / "error: ..."
+
+-- Base alert levels (like DEFCON): 5 = calm, 1 = all-out war
+local LEVELS = {
+  [1] = { name = "WAR",      alerts = true,  ping = "@here", cooldown = 30,  hostileUnknown = true },
+  [2] = { name = "HIGH",     alerts = true,  ping = "@here", cooldown = 60,  hostileUnknown = true },
+  [3] = { name = "ELEVATED", alerts = true,  ping = nil,     cooldown = 120 },
+  [4] = { name = "GUARDED",  alerts = true,  ping = nil,     cooldown = nil },
+  [5] = { name = "PEACE",    alerts = false, ping = nil,     cooldown = nil, quiet = true },
+}
+local function curLevel() return tonumber(state.level) or CFG.startLevel or 4 end
+local function lvl() return LEVELS[curLevel()] or LEVELS[4] end
+
+-- "white", "black" or nil.  Monitor choices override the config tables.
+-- Minecraft names are case-insensitive, so "That_guy_luxe" matches "That_Guy_Luxe"
+local function inSet(set, name)
+  if set[name] then return true end
+  local l = name:lower()
+  for k, v in pairs(set) do
+    if v and type(k) == "string" and k:lower() == l then return true end
+  end
+  return false
+end
+
+local function listOf(name)
+  local v = lists[name]
+  if v == nil then                       -- monitor/Discord choice, any capitalisation
+    local l = name:lower()
+    for k, val in pairs(lists) do if k:lower() == l then v = val break end end
+  end
+  if v == "white" or v == "black" or v == "ignore" then return v end
+  if v == "normal" then return nil end
+  if inSet(CFG.ignore, name) then return "ignore" end
+  if inSet(CFG.blacklist, name) then return "black" end
+  if inSet(CFG.friends, name) then return "white" end
+  return nil
+end
+
+local function save()
+  local f = fs.open(CFG.logFile, "w")
+  f.write(textutils.serialize({ v = 2, log = log, known = known, state = state, lists = lists },
+                              { compact = true }))
+  f.close()
+end
+
+local function load()
+  for _, file in ipairs({ CFG.logFile, "godseye.log" }) do   -- also reads v1 logs
+    if fs.exists(file) then
+      local f = fs.open(file, "r")
+      local data = textutils.unserialize(f.readAll())
+      f.close()
+      if type(data) == "table" then
+        if data.v == 2 then
+          log, known, state = data.log or {}, data.known or {}, data.state or state
+          lists = data.lists or {}
+        else
+          log = data
+        end
+        for _, e in ipairs(log) do if not e.leave and not e.leaveT then e.leave = "??" end end
+        return
+      end
+    end
+  end
+end
+
+------------------------------------------------------------------
+-- DISCORD
+------------------------------------------------------------------
+local RED_HEX = 14881563   -- 0xE3131B
+
+-- true when anything Discord is configured (bot or webhook)
+local function webhookOn() return http and (botOn() or CFG.webhookUrl ~= "") end
+
+-- sends through the bot (with buttons) when set up, otherwise the webhook
+local function postWebhook(payload, components)
+  if botOn() then
+    payload.username = nil                 -- bots can't rename per message
+    payload.components = components
+    return bot:send(CFG.botChannel, payload)
+  end
+  if not (http and CFG.webhookUrl ~= "") then return false end
+  local ok, err = pcall(http.request, {
+    url = CFG.webhookUrl,
+    body = textutils.serializeJSON(payload),
+    headers = { ["Content-Type"] = "application/json" },
+    method = "POST",
+  })
+  if not ok then lastErr = "webhook: " .. tostring(err) end
+  return ok
+end
+
+-- Discord components (only shown when the bot is used)
+local function playerButtons(name)
+  if not discord then return nil end
+  return { discord.row(
+    discord.button("Whitelist", "ge:white:"  .. name, discord.GREEN),
+    discord.button("Blacklist", "ge:black:"  .. name, discord.RED),
+    discord.button("Ignore",    "ge:ignore:" .. name, discord.GREY)) }
+end
+
+local function reportMenus(names)
+  if not discord or #names == 0 then return nil end
+  return {
+    discord.select("ge:white",  "Whitelist...", names),
+    discord.select("ge:black",  "Blacklist...", names),
+    discord.select("ge:ignore", "Ignore...",    names),
+  }
+end
+
+local function onSiteNames()
+  local t = {}
+  for _, a in pairs(active) do t[#t + 1] = a.name end
+  return t
+end
+
+local function buildReport(sinceT, nowT)
+  local lines, unique, nUnique, count, names = {}, {}, 0, 0, {}
+  for i = #log, 1, -1 do                         -- oldest first
+    local e = log[i]
+    if e.arriveT and e.arriveT >= sinceT then
+      count = count + 1
+      if not unique[e.name] then
+        unique[e.name] = true
+        nUnique = nUnique + 1
+        if not e.name:find("^UNKNOWN") then names[#names + 1] = e.name end
+      end
+      local left = e.leaveT and ("<t:%d:t>"):format(e.leaveT) or "**still here**"
+      local l = listOf(e.name)
+      lines[#lines + 1] = ("%s`%s` arrived <t:%d:t> | left %s | %s | closest %s"):format(
+        l == "black" and "**[BLACKLISTED]** " or (l == "white" and "(whitelist) " or ""),
+        e.name, e.arriveT, left,
+        e.stay and fmtDur(e.stay) or "-",
+        e.closest and (e.closest .. "m " .. (e.dir or "")) or "-")
+    end
+  end
+  if count == 0 and CFG.quietReports then return nil end
+  local desc = #lines > 0 and table.concat(lines, "\n") or "No contacts. All quiet."
+  if #desc > 3900 then desc = desc:sub(1, 3900) .. "\n... (truncated)" end
+  local here = onSiteNames()
+  return {
+    username = "God's Eye",
+    embeds = { {
+      title = "GOD'S EYE // Report for " .. CFG.baseName,
+      description = desc,
+      color = RED_HEX,
+      fields = {
+        { name = "Visits",      value = tostring(count),   inline = true },
+        { name = "Unique",      value = tostring(nUnique), inline = true },
+        { name = "On site now", value = #here > 0 and table.concat(here, ", ") or "nobody", inline = true },
+      },
+      footer = { text = ("%s - %s %s"):format(CFG.baseName, fmtT(nowT, { date = true }), CFG.tzLabel) },
+      timestamp = isoUTC(nowT),
+    } },
+  }, names
+end
+
+local function sendArrivalAlert(entry, visits)
+  local l = listOf(entry.name)
+  if not webhookOn() or l == "white" then return end
+  local L = lvl()
+  if (not CFG.instantAlerts or not L.alerts) and l ~= "black" then return end   -- blacklist always alerts
+  local k = known[entry.name]
+  local cooldown = l == "black" and 60 or (L.cooldown or CFG.alertCooldown)
+  if k and k.lastAlert and nowSec() - k.lastAlert < cooldown then return end
+  if k then k.lastAlert = nowSec() end
+  local ping = l == "black" and CFG.blackPing or (L.ping or CFG.alertPing)
+  local title = l == "black" and "BLACKLISTED PLAYER: "
+                or (L.hostileUnknown and "HOSTILE CONTACT: "
+                or (visits <= 1 and "NEW CONTACT: " or "CONTACT: "))
+  postWebhook({
+    username = "God's Eye",
+    content = ping ~= "" and ping or nil,
+    embeds = { {
+      title = title .. entry.name,
+      description = ("Arrived at **%s** <t:%d:t> (%s %s)\n%s\nVisit #%d"):format(
+        CFG.baseName, entry.arriveT, fmtT(entry.arriveT), CFG.tzLabel,
+        entry.closest and ("First seen %dm %s of base"):format(entry.closest, entry.dir or "")
+          or ((entry.dir or "") ~= "" and ("Seen %s of base"):format(entry.dir) or ""),
+        visits) .. ("\nBase level: **%d %s**"):format(curLevel(), L.name)
+        .. (entry.source and ("\nReported by **" .. entry.source .. "** (remote)") or ""),
+      color = RED_HEX,
+      timestamp = isoUTC(entry.arriveT),
+    } },
+  }, (not entry.name:find("^UNKNOWN")) and playerButtons(entry.name) or nil)
+end
+
+local function reportKey(utc)
+  return math.floor(localSec(utc) / (CFG.reportMinutes * 60))
+end
+
+local function checkReport()
+  if not webhookOn() then return end
+  local now = nowSec()
+  local key = reportKey(now)
+  if not state.lastReportKey then                -- first boot: start the clock
+    state.lastReportKey, state.lastReportT = key, now
+    save()
+    return
+  end
+  if key ~= state.lastReportKey then
+    local payload, names = buildReport(state.lastReportT or (now - CFG.reportMinutes * 60), now)
+    if payload then postWebhook(payload, reportMenus(names or {})) end
+    state.lastReportKey, state.lastReportT = key, now
+    save()
+  end
+end
+
+------------------------------------------------------------------
+-- COMMAND: probe / test
+------------------------------------------------------------------
+local args = { ... }
+
+if args[1] == "test" then
+  if not http then print("HTTP is disabled in the CC:Tweaked config.") return end
+  if bot then
+    if CFG.botChannel == "" then print("Bot token found, but botChannel is empty.") return end
+    local res, err = bot:requestSync("POST", "/channels/" .. CFG.botChannel .. "/messages", {
+      embeds = { { title = "GOD'S EYE // bot online", color = RED_HEX,
+        description = ("Watching **%s**. Buttons below are a test (they won't change anything).")
+                      :format(CFG.baseName) } },
+      components = { discord.row(
+        discord.button("Whitelist", "ge:test:1", discord.GREEN),
+        discord.button("Blacklist", "ge:test:2", discord.RED),
+        discord.button("Ignore",    "ge:test:3", discord.GREY)) },
+    })
+    if res then print("Bot message sent! Check Discord.")
+    else print("Bot failed: " .. tostring(err)) end
+    return
+  end
+  if CFG.webhookUrl == "" then print("Set webhookUrl in the config first.") return end
+  local body = textutils.serializeJSON({ username = "God's Eye", embeds = { {
+    title = "GOD'S EYE // online", color = RED_HEX,
+    description = ("Watching **%s** (radius %d). Time: %s %s"):format(
+      CFG.baseName, CFG.radius, fmtT(nowSec(), { date = true }), CFG.tzLabel) } } })
+  local h, err, eh = http.post(CFG.webhookUrl, body, { ["Content-Type"] = "application/json" })
+  if h then print("Sent! Check Discord.") h.close()
+  else print("Failed: " .. tostring(err)) if eh then print(eh.readAll()) eh.close() end end
+  return
+end
+
+if args[1] == "probe" then
+  print("== Attached peripherals ==")
+  for _, n in ipairs(peripheral.getNames()) do
+    print(("  %-22s %s"):format(n, peripheral.getType(n)))
+  end
+  print("\n== Player detector: " .. tostring(detectorName or "NOT FOUND") .. " ==")
+  if detector then
+    local ok, res = pcall(detector.getPlayersInRange, CFG.radius)
+    print("  inRange: " .. (ok and textutils.serialize(res, { compact = true }) or ("ERROR " .. tostring(res))))
+  end
+  print(("  Time now: %s %s"):format(fmtT(nowSec(), { date = true, secs = true }), CFG.tzLabel))
+  print("  Webhook: " .. (webhookOn() and "set" or "off"))
+  if radar then
+    print("\n== Radar: " .. radarName .. " ==")
+    print("  " .. table.concat(peripheral.getMethods(radarName) or {}, ", "))
+    -- one line per radar contact, also saved to probe.txt (open with: edit probe.txt)
+    local out = {}
+    for _, m in ipairs({ "getTracks", "getTargets", "getContacts", "getEntities", "scan" }) do
+      if type(radar[m]) == "function" then
+        local ok, res = pcall(radar[m])
+        if ok and type(res) == "table" then
+          out[#out + 1] = "== " .. m .. "() =="
+          for k, t in pairs(res) do
+            if type(t) == "table" then
+              local p = t.position or {}
+              out[#out + 1] = ("cat=%s | type=%s | kind=%s | name=%s | pos=%s,%s,%s"):format(
+                tostring(t.category), tostring(t.entityType or t.type), tostring(t.kind),
+                tostring(t.name or t.displayName), tostring(p.x), tostring(p.y), tostring(p.z))
+              local keys = {}
+              for kk in pairs(t) do keys[#keys + 1] = tostring(kk) end
+              out[#out + 1] = "   fields: " .. table.concat(keys, ", ")
+            end
+          end
+          break
+        end
+      end
+    end
+    for _, line in ipairs(out) do print(line) end
+    local f = fs.open("probe.txt", "w") f.write(table.concat(out, "\n")) f.close()
+    print("\nSaved to probe.txt  (edit probe.txt to scroll)")
+  else
+    print("\nNo radar found.")
+  end
+  return
+end
+
+------------------------------------------------------------------
+-- READING CONTACTS
+------------------------------------------------------------------
+local RADAR_METHODS = { "getTracks", "getTargets", "getContacts", "getEntities", "scan" }
+
+local function readRadarRaw()
+  if not radar then return {} end
+  for _, m in ipairs(RADAR_METHODS) do
+    if type(radar[m]) == "function" then
+      local ok, res = pcall(radar[m])
+      if ok and type(res) == "table" then return res end
+    end
+  end
+  return {}
+end
+
+local function xyz(t)
+  local p = t.position or t.pos or t.location or t
+  if type(p) ~= "table" then return end
+  local x, y, z = p.x or p[1], p.y or p[2], p.z or p[3]
+  if type(x) == "number" and type(z) == "number" then return x, y or CFG.baseY, z end
+end
+
+local function fromTrack(key, t)
+  if type(t) ~= "table" then return end
+  -- strict: only contacts the radar explicitly marks as a player
+  -- (Sable ships/sub-levels and contraptions often have no type at all)
+  local kind = lower(t.category) .. " " .. lower(t.type) .. " " .. lower(t.entityType) .. " " .. lower(t.kind)
+  if CFG.onlyPlayers then
+    if not kind:find("player") then return end
+    -- something tagged PLAYER but whose entity type is not a player (e.g. Sable objects)
+    local et = lower(t.entityType)
+    if et ~= "" and not et:find("player") then return end
+    -- block/ship-like tracks
+    if kind:find("sable") or kind:find("ship") or kind:find("contraption")
+       or kind:find("sub_level") or kind:find("sublevel") then return end
+  end
+  local ent  = type(t.entity) == "table" and t.entity or {}
+  local id   = tostring(t.id or t.uuid or t.entityId or ent.uuid or t.trackId or key)
+  local name = t.name or t.playerName or t.displayName or t.username or t.entityName or ent.name
+  if type(name) ~= "string" or name == "" then name = nil end
+  local x, y, z = xyz(t)
+  return { id = "R:" .. id, name = name or ("UNKNOWN-" .. id:sub(1, 5)),
+           named = name ~= nil, x = x, y = y, z = z }
+end
+
+local detectorOk, linkLostAt = false, nil   -- false while the detector is unplugged / erroring
+
+local function readDetector()
+  local out = {}
+  detectorOk = false
+  if not detector then return out end
+  local names, trusted
+  for _, r in ipairs({ CFG.radius, 64, 32, 16 }) do
+    if r <= CFG.radius then
+      local ok, res = pcall(detector.getPlayersInRange, r)
+      if ok and type(res) == "table" then names, trusted = res, true break end
+      lastErr = "detector: " .. tostring(res)
+    end
+  end
+  if not names and detector.getOnlinePlayers then
+    local ok, res = pcall(detector.getOnlinePlayers)
+    if ok and type(res) == "table" then names, trusted = res, false end
+  end
+  if not names then return out end
+  detectorOk = trusted == true
+  if trusted and lastErr and lastErr:find("^detector") then lastErr = nil end
+  for _, n in ipairs(names) do
+    local x, y, z
+    local ok, p = pcall(detector.getPlayerPos, n)
+    if ok and type(p) == "table" and type(p.x) == "number" then x, y, z = p.x, p.y, p.z end
+    if trusted or x then
+      out[#out + 1] = { id = "P:" .. n, name = n, named = true, x = x, y = y, z = z, trusted = trusted }
+    end
+  end
+  return out
+end
+
+local function dist2D(c)
+  if not c.x then return nil end
+  local dx, dz = c.x - CFG.baseX, c.z - CFG.baseZ
+  return math.sqrt(dx * dx + dz * dz)
+end
+
+-- radar track ids are entity UUIDs; learn which UUID belongs to which name
+local uuidToName, scanCount = {}, 0
+local shipTracks = {}
+local function learnUuids(players)
+  for _, d in ipairs(players) do
+    for _, fn in ipairs({ "getPlayer", "getPlayerPos" }) do
+      if detector and detector[fn] then
+        local ok, p = pcall(detector[fn], d.name)
+        if ok and type(p) == "table" and type(p.uuid) == "string" then
+          uuidToName[p.uuid:lower()] = d.name
+          break
+        end
+      end
+    end
+  end
+end
+
+-- players reported by a pocket computer (remote_injector.lua) over the modem
+local remote = {}              -- remote[lowercase name] = { name, x, y, z, dir, source, untilMs }
+local DIR_VEC = { N = { 0, -1 }, NE = { 1, -1 }, E = { 1, 0 }, SE = { 1, 1 },
+                  S = { 0, 1 }, SW = { -1, 1 }, W = { -1, 0 }, NW = { -1, -1 } }
+
+local function openRemote()
+  if not CFG.remoteChannel then return end
+  peripheral.find("modem", function(_, m) pcall(m.open, CFG.remoteChannel) return false end)
+end
+openRemote()
+
+local function coord(v)
+  v = tonumber(v)
+  if v and v == v and math.abs(v) < 3e7 then return v end
+end
+
+-- returns ok, message (message goes back to the pocket)
+local function handleRemote(msg)
+  if type(msg) ~= "table" then return false, "bad packet" end
+  if CFG.remoteKey ~= "" and msg.key ~= CFG.remoteKey then return false, "wrong key" end
+  local name = msg.name
+  if type(name) ~= "string" or not name:match("^[%w_]+$") or #name > 16 then
+    return false, "bad player name"
+  end
+  if msg.action == "REMOVE_PLAYER" then
+    local r = remote[name:lower()]
+    if not r then return false, name .. " was not injected" end
+    r.untilMs = 0
+    return true, name .. " removed (visit closes in " .. CFG.leaveAfter .. "s)"
+  end
+  if msg.action ~= "INJECT_PLAYER" then return false, "unknown action" end
+  local x, y, z = coord(msg.x), coord(msg.y), coord(msg.z)
+  if (x == nil) ~= (z == nil) then return false, "need both x and z" end
+  local dir = type(msg.dir) == "string" and msg.dir:upper() or nil
+  if dir and not DIR_VEC[dir] then dir = nil end
+  local dist = coord(msg.dist)
+  if not x and dir and dist then           -- "NW 60" -> a point 60 blocks NW of base
+    local v = DIR_VEC[dir]
+    local len = math.sqrt(v[1] * v[1] + v[2] * v[2])
+    x = math.floor(CFG.baseX + v[1] / len * dist + 0.5)
+    z = math.floor(CFG.baseZ + v[2] / len * dist + 0.5)
+  end
+  remote[name:lower()] = {
+    name = name, x = x, y = y or (x and CFG.baseY), z = z, dir = dir,
+    source = type(msg.source) == "string" and msg.source:sub(1, 24) or "remote",
+    untilMs = nowMs() + CFG.remoteTTL * 1000,
+  }
+  local where = x and ("%d %d %d"):format(math.floor(x), math.floor(y or CFG.baseY), math.floor(z))
+                or (dir or "no position")
+  return true, name .. " injected at " .. where
+end
+
+local function remoteContacts(named, blips)
+  local out, now = {}, nowMs()
+  local seen = {}                          -- don't double up on someone the hardware already sees
+  for _, d in ipairs(named) do seen[d.name:lower()] = true end
+  for _, c in ipairs(blips) do if c.named then seen[c.name:lower()] = true end end
+  for key, r in pairs(remote) do
+    if now > r.untilMs then
+      remote[key] = nil
+    elseif not seen[key] then
+      out[#out + 1] = { id = "X:" .. r.name, name = r.name, named = true, x = r.x, y = r.y, z = r.z,
+                        dir = r.dir, source = r.source, trusted = true }
+    end
+  end
+  return out
+end
+
+local function scan()
+  local named = readDetector()
+  scanCount = scanCount + 1
+  if scanCount % 15 == 1 then learnUuids(named) end
+  local blips = {}
+  local ships = {}
+  for k, t in pairs(readRadarRaw()) do
+    local c = fromTrack(k, t)
+    if c then blips[#blips + 1] = c end
+    if type(t) == "table" then                 -- ships/contraptions for the radar page
+      local kind = lower(t.category) .. " " .. lower(t.type) .. " " .. lower(t.entityType) .. " " .. lower(t.kind)
+      if kind:find("sable") or kind:find("ship") or kind:find("contraption")
+         or kind:find("sub_level") or kind:find("sublevel") then
+        local x, y, z = xyz(t)
+        if x then ships[#ships + 1] = { x = x, y = y, z = z } end
+      end
+    end
+  end
+  shipTracks = ships
+  local claimed = {}
+  local function claim(d, c)
+    claimed[d] = true
+    c.dropped = true
+    if not d.x then d.x, d.y, d.z = c.x, c.y, c.z end
+  end
+  -- 1) radar UUID -> name (learned from the detector when it shares UUIDs)
+  for _, c in ipairs(blips) do
+    if not c.named then
+      local n = uuidToName[c.id:sub(3):lower()]
+      if n then c.name, c.named = n, true end
+    end
+  end
+  -- 2) same name, or 3) detector position close to the blip
+  for _, c in ipairs(blips) do
+    for _, d in ipairs(named) do
+      if not claimed[d] then
+        local sameName = c.named and c.name == d.name
+        local samePos  = not c.named and c.x and d.x
+                         and math.abs(d.x - c.x) < 12 and math.abs(d.z - c.z) < 12
+        if sameName or samePos then claim(d, c) break end
+      end
+    end
+  end
+  -- 4) server hides positions: ask the detector "who is in this small box?"
+  if detector and detector.getPlayersInCoords then
+    for _, c in ipairs(blips) do
+      if not c.dropped and not c.named and c.x then
+        local x, y, z = math.floor(c.x), math.floor(c.y or CFG.baseY), math.floor(c.z)
+        local ok, res = pcall(detector.getPlayersInCoords,
+          { x = x - 3, y = y - 4, z = z - 3 }, { x = x + 3, y = y + 4, z = z + 3 })
+        if ok and type(res) == "table" then
+          local candidates = {}
+          for _, n in ipairs(res) do
+            for _, d in ipairs(named) do
+              if not claimed[d] and d.name == n then candidates[#candidates + 1] = d end
+            end
+          end
+          if #candidates == 1 then claim(candidates[1], c) end
+        end
+      end
+    end
+  end
+  local freeB, freeD = {}, {}
+  for _, c in ipairs(blips) do if not c.dropped and not c.named then freeB[#freeB + 1] = c end end
+  for _, d in ipairs(named) do if not claimed[d] then freeD[#freeD + 1] = d end end
+  if #freeB == 1 and #freeD == 1 then claim(freeD[1], freeB[1]) end
+
+  local inRange = {}
+  local function consider(c)
+    c.dist = dist2D(c)
+    local near = c.trusted or not c.dist or c.dist <= CFG.radius
+    if near and listOf(c.name) ~= "ignore" then inRange[#inRange + 1] = c end
+  end
+  for _, d in ipairs(named) do consider(d) end
+  for _, c in ipairs(blips) do if not c.dropped then consider(c) end end
+  for _, c in ipairs(remoteContacts(named, blips)) do consider(c) end
+  return inRange
+end
+
+------------------------------------------------------------------
+-- TRACKING VISITS
+------------------------------------------------------------------
+local alertUntil = 0
+
+local function update(contacts)
+  local now, nowS, changed = nowMs(), nowSec(), false
+  for _, c in ipairs(contacts) do
+    local a = active[c.id]
+    if not a then
+      local l = listOf(c.name)
+      local friend = l == "white" or nil
+      local k = known[c.name] or { visits = 0 }
+      known[c.name] = k
+      k.visits = k.visits + 1
+      k.last = nowS
+      local entry = { name = c.name, arriveT = nowS, game = gameStamp(), friend = friend,
+                      closest = c.dist and math.floor(c.dist),
+                      dir = (c.x and compass(c.x, c.z)) or c.dir or "",
+                      visit = k.visits, source = c.source }
+      table.insert(log, 1, entry)
+      while #log > CFG.maxLog do table.remove(log) end
+      a = { name = c.name, first = now, entry = entry, closest = c.dist or math.huge, friend = friend }
+      active[c.id] = a
+      changed = true
+      if not friend then
+        alertUntil = now + (l == "black" and 15000 or 6000)
+        if speaker then
+          if l == "black" then
+            for i = 1, 3 do pcall(speaker.playNote, "pling", 3, 24 - i * 4) end
+            pcall(speaker.playSound, "minecraft:block.bell.use", 3, 1)
+          elseif not lvl().quiet then
+            pcall(speaker.playNote, "bit", lvl().hostileUnknown and 3 or 2, 18)
+          end
+        end
+        sendArrivalAlert(entry, k.visits)
+      end
+    end
+    local l = listOf(c.name)                  -- live, so list changes apply instantly
+    a.friend, a.black = (l == "white") or nil, (l == "black") or nil
+    if c.dist and a.dist then                 -- smoothed: negative = closing in
+      a.trend = (a.trend or 0) * 0.6 + (c.dist - a.dist) * 0.4
+    end
+    a.last, a.x, a.y, a.z, a.dist = now, c.x, c.y, c.z, c.dist
+    if c.dist and c.dist < a.closest then
+      a.closest = c.dist
+      a.entry.closest = math.floor(c.dist)
+      a.entry.dir = compass(c.x, c.z)
+    end
+  end
+  -- Link guard: if the detector dropped off the network, everyone "vanishes".
+  -- Don't log that as them leaving (it causes fake leave + fake NEW CONTACT alerts
+  -- when it reconnects). Hold visits open for linkGrace seconds.
+  if detectorOk then
+    if linkLostAt then
+      for _, a in pairs(active) do a.last = math.max(a.last, now - 1000) end
+    end
+    linkLostAt = nil
+  else
+    linkLostAt = linkLostAt or now
+    if not lastErr then lastErr = "detector link lost" end
+  end
+  local holding = linkLostAt and (now - linkLostAt) < CFG.linkGrace * 1000
+  for id, a in pairs(active) do
+    if not holding and now - a.last > CFG.leaveAfter * 1000 then
+      a.entry.leaveT = math.floor(a.last / 1000)
+      a.entry.stay   = math.floor((a.last - a.first) / 1000)
+      if known[a.name] then known[a.name].last = a.entry.leaveT end
+      active[id] = nil
+      changed = true
+    end
+  end
+  if changed then save() end
+  if CFG.alarmSide then
+    local intruder = false
+    for _, a in pairs(active) do if not a.friend then intruder = true end end
+    redstone.setOutput(CFG.alarmSide, intruder)
+  end
+end
+
+------------------------------------------------------------------
+-- HUD FEED  (broadcast state for glasses / other team computers)
+------------------------------------------------------------------
+local hudModem
+
+local function findHudModem()
+  if not CFG.hudChannel then return nil end
+  if CFG.hudModem then return peripheral.wrap(CFG.hudModem) end
+  return peripheral.find("modem", function(_, m) return m.isWireless and m.isWireless() end)
+end
+hudModem = findHudModem()
+
+-- SECURE < CONTACT < BREACH < BLACKLIST.  LINK_LOST overrides when the detector is down.
+local function threatLevel()
+  if not detectorOk then return "LINK_LOST", nil end
+  local level, who = "SECURE", nil
+  local rank = { SECURE = 0, CONTACT = 1, BREACH = 2, BLACKLIST = 3 }
+  for _, a in pairs(active) do
+    if not a.friend then
+      local l = a.black and "BLACKLIST"
+                or ((a.dist and a.dist <= CFG.breachRadius) and "BREACH" or "CONTACT")
+      if rank[l] > rank[level] then level, who = l, a.name end
+    end
+  end
+  return level, who
+end
+
+local function broadcastHud()
+  if not (hudModem and CFG.hudChannel) then return end
+  local now = nowMs()
+  local contacts = {}
+  for _, a in pairs(active) do
+    local k = known[a.name]
+    contacts[#contacts + 1] = {
+      name = a.name, x = a.x, y = a.y, z = a.z,
+      dist = a.dist and math.floor(a.dist), dir = compass(a.x, a.z),
+      list = a.black and "black" or (a.friend and "white" or "unknown"),
+      visits = k and k.visits or 1,
+      onSite = math.floor((now - a.first) / 1000),
+      closing = a.trend and a.trend < -0.3 or false,
+    }
+  end
+  table.sort(contacts, function(p, q) return (p.dist or 1e9) < (q.dist or 1e9) end)
+  local recent = {}
+  for i = 1, math.min(5, #log) do
+    local e = log[i]
+    recent[i] = { name = e.name, arrive = e.arriveT and fmtT(e.arriveT) or "?",
+                  left = e.leaveT and fmtT(e.leaveT) or nil, dir = e.dir, closest = e.closest,
+                  list = listOf(e.name) or "unknown" }
+  end
+  local level, who = threatLevel()
+  pcall(hudModem.transmit, CFG.hudChannel, CFG.hudChannel, {
+    proto = "godseye", v = 1, t = nowSec(), clock = fmtT(nowSec()),
+    base = { name = CFG.baseName, x = CFG.baseX, y = CFG.baseY, z = CFG.baseZ,
+             radius = CFG.radius, breach = CFG.breachRadius },
+    status = level, statusWho = who,
+    level = curLevel(), levelName = lvl().name, hostileUnknown = lvl().hostileUnknown or false,
+    link = { radar = radar ~= nil, detector = detectorOk },
+    contacts = contacts, recent = recent,
+  })
+end
+
+------------------------------------------------------------------
+-- DRAWING
+------------------------------------------------------------------
+local RED, DARK, DIM, BRIGHT, BLACK = colors.red, colors.brown, colors.lightGray, colors.white, colors.black
+
+if mon.setTextScale then mon.setTextScale(CFG.textScale) end
+if mon.setPaletteColor then
+  mon.setPaletteColor(BLACK,  0x000000)
+  mon.setPaletteColor(RED,    0xE3131B)
+  mon.setPaletteColor(DARK,   0x3D0406)
+  mon.setPaletteColor(DIM,    0x8C2A2E)
+  mon.setPaletteColor(BRIGHT, 0xFFD6D6)
+end
+
+local W, H = mon.getSize()
+W, H = W or 51, H or 19
+local buttons = {}
+local rowTargets = {}                 -- rowTargets[y] = player name on that row
+local selected, selectedUntil = nil, 0
+local toast, toastUntil = nil, 0      -- short confirmation message in the footer
+local sweep, logPage, pageCount = 0, 1, 1
+local confirmClearUntil = 0
+local levelPickUntil = 0
+local page = "log"                    -- "log" (text monitor) or "radar" (GPU)
+local disp, dpw, dph = nil, 0, 0      -- DirectGPU display id + pixel size (radar page)
+
+local function mark(name)             -- prefix shown before names
+  local l = listOf(name)
+  return l == "black" and "!" or (l == "white" and "+" or "")
+end
+
+local function fit(s, n)
+  s = tostring(s or "")
+  if n <= 0 then return "" end
+  if #s > n then return s:sub(1, n) end
+  return s .. (" "):rep(n - #s)
+end
+
+local function put(x, y, s, fg, bg)
+  mon.setCursorPos(x, y)
+  mon.setBackgroundColor(bg or BLACK)
+  mon.setTextColor(fg or RED)
+  mon.write(s)
+end
+
+local function bar(y, bg) put(1, y, (" "):rep(W), RED, bg) end
+local function section(x, y, w, title) put(x, y, fit(" " .. title, w), RED, DARK) end
+
+local function drawHeader()
+  local flashing = nowMs() < alertUntil and (math.floor(nowMs() / 400) % 2 == 0)
+  local bg = flashing and BRIGHT or RED
+  bar(1, bg)
+  put(2, 1, "<(\7)>  G O D ' S   E Y E", BLACK, bg)
+  local c = fmtT(nowSec(), { secs = true }) .. " " .. CFG.tzLabel
+  put(W - #c, 1, c, BLACK, bg)
+
+  bar(2, BLACK)
+  local n, intr, blk = 0, 0, nil
+  for _, a in pairs(active) do
+    n = n + 1
+    if not a.friend then intr = intr + 1 end
+    if a.black then blk = a.name end
+  end
+  local disc
+  if botOn() then disc = "BOT:" .. (bot.status == "online" and "ON" or bot.status:upper())
+  else disc = "HOOK:" .. (webhookOn() and "ON" or "OFF") end
+  local status = ("LVL %d %s  RADAR:%s  DETECT:%s  WEB:%s  %s  %s"):format(
+    curLevel(), lvl().name, radar and "ON" or "--", detectorOk and "ON" or (detector and "ERR" or "OFF"),
+    webStatus == "online" and "ON" or (webStatus == "off" and "--" or "ERR"), disc, CFG.baseName)
+  put(2, 2, fit(status, W - 15), DIM)
+  local tag = (not detectorOk) and "!! LINK LOST !!" or blk and ("!! BLACKLISTED: " .. blk .. " !!")
+              or (intr > 0 and ("! %d INTRUDER%s !"):format(intr, intr > 1 and "S" or "")
+              or (n > 0 and "WHITELIST ONLY" or "AREA CLEAR"))
+  if blk or not detectorOk then put(W - #tag, 2, tag, BLACK, RED)
+  else put(W - #tag, 2, tag, intr > 0 and BRIGHT or DIM) end
+  bar(3, DARK)
+end
+
+local function logRow(e)
+  local arrive = e.arriveT and fmtT(e.arriveT, { date = true }) or (e.arrive or "?")
+  local left
+  if e.leaveT then left = fmtT(e.leaveT)
+  elseif e.leave then left = e.leave
+  else left = "ON SITE" end
+  local who = mark(e.name) .. (e.source and "*" or "") .. e.name   -- * = reported by a pocket
+  local close = e.closest and (e.closest .. "m " .. (e.dir or "")) or ((e.dir or "") ~= "" and e.dir) or "-"
+  return ("%s %s %s %s %s"):format(fit(arrive, 14), fit(who, 16), fit(left, 8),
+    fit(e.stay and fmtDur(e.stay) or "", 6), close)
+end
+
+local listRight = 0
+local function drawLists(x, w, top, bottom)
+  listRight = x + w - 1
+  local list = {}
+  for _, a in pairs(active) do list[#list + 1] = a end
+  table.sort(list, function(p, q) return (p.dist or 1e9) < (q.dist or 1e9) end)
+
+  local y = top
+  section(x, y, w, ("ON SITE NOW (%d)"):format(#list)) y = y + 1
+  local maxActive = math.max(2, math.min(#list, math.floor((bottom - top) / 3)))
+  if #list == 0 then
+    put(x, y, fit("  no contacts", w), DIM) y = y + 1
+  else
+    for i = 1, math.min(#list, maxActive) do
+      local a = list[i]
+      local k = known[a.name]
+      local d = a.dist and (math.floor(a.dist) .. "m " .. compass(a.x, a.z)) or "?m"
+      local tag = a.black and "BLACKLIST" or (a.friend and "WHITELIST"
+                  or ((k and k.visits <= 1) and "NEW" or ("x" .. (k and k.visits or 1))))
+      local row = ("%s %s %-8s %-7s %s"):format(a.friend and " " or "\16",
+                  fit(mark(a.name) .. a.name, 16), d, fmtDur((nowMs() - a.first) / 1000), tag)
+      local fg, bg = a.friend and DIM or BRIGHT, BLACK
+      if a.black then fg, bg = BLACK, RED end
+      if a.name == selected then bg = DARK fg = BRIGHT end
+      put(x, y, fit(row, w), fg, bg)
+      rowTargets[y] = a.name
+      y = y + 1
+    end
+  end
+  put(x, y, (" "):rep(w)) y = y + 1          -- clear spacer (stops leftover rows)
+
+  section(x, y, w, "ARRIVAL LOG") y = y + 1
+  put(x, y, fit(("%-14s %-16s %-8s %-6s %s"):format("ARRIVED", "WHO", "LEFT", "STAYED", "CLOSEST"), w), DIM)
+  y = y + 1
+  local rows = math.max(1, bottom - y + 1)
+  pageCount = math.max(1, math.ceil(#log / rows))
+  if logPage > pageCount then logPage = pageCount end
+  local first = (logPage - 1) * rows + 1
+  for i = first, math.min(#log, first + rows - 1) do
+    local e = log[i]
+    local l = listOf(e.name)
+    local fg = (not e.leaveT and not e.leave) and BRIGHT or (l == "white" and DIM or RED)
+    if l == "black" then fg = BRIGHT end
+    local bg = (e.name == selected) and DARK or BLACK
+    put(x, y, fit(logRow(e), w), fg, bg)
+    rowTargets[y] = e.name
+    y = y + 1
+  end
+  while y <= bottom do put(x, y, (" "):rep(w)) y = y + 1 end
+end
+
+local function drawScope(x0, y0, pw, ph)
+  local cx, cy = (pw + 1) / 2, (ph + 1) / 2
+  local blips = {}
+  for _, a in pairs(active) do
+    if a.x then
+      local bx = math.floor(cx + (a.x - CFG.baseX) / CFG.radius * (pw / 2) + 0.5)
+      local by = math.floor(cy + (a.z - CFG.baseZ) / CFG.radius * (ph / 2) + 0.5)
+      blips[by * 1000 + bx] = a
+    end
+  end
+  local BK, RD, DK, DM, BR = colors.toBlit(BLACK), colors.toBlit(RED),
+                             colors.toBlit(DARK), colors.toBlit(DIM), colors.toBlit(BRIGHT)
+  for py = 1, ph do
+    local t, f, b = {}, {}, {}
+    for px = 1, pw do
+      local dx, dy = (px - cx) / (pw / 2), (py - cy) / (ph / 2)
+      local r = math.sqrt(dx * dx + dy * dy)
+      local ch, fg, bg = " ", DM, BK
+      if r <= 1.02 then
+        local ang = (atan2(dy, dx) - sweep) % (2 * math.pi)
+        if ang > 2 * math.pi - 0.45 then bg = DK end
+        if math.abs(r - 1) < 0.06 or math.abs(r - 0.5) < 0.04 then ch = "\7" end
+        if math.abs(dx) < 0.02 or math.abs(dy) < 0.03 then ch = "\183" end
+      end
+      if py == 1 and px == math.floor(cx + 0.5) then ch, fg = "N", RD end
+      if px == math.floor(cx + 0.5) and py == math.floor(cy + 0.5) then ch, fg = "+", RD end
+      local a = blips[py * 1000 + px]
+      if a then ch, fg, bg = a.name:sub(1, 1):upper(), BK, a.black and RD or (a.friend and DM or BR) end
+      t[px], f[px], b[px] = ch, fg, bg
+    end
+    mon.setCursorPos(x0, y0 + py - 1)
+    mon.blit(table.concat(t), table.concat(f), table.concat(b))
+  end
+end
+
+local function nextReportIn()
+  if not webhookOn() then return nil end
+  local period = CFG.reportMinutes * 60
+  local ls = localSec(nowSec())
+  return period - ls % period
+end
+
+local function drawFooter()
+  bar(H, DARK)
+  buttons = {}
+  local x = W
+  local function button(id, label, fg, bg)
+    x = x - #label
+    put(x, H, label, fg or BLACK, bg or RED)
+    buttons[#buttons + 1] = { id = id, x1 = x, x2 = x + #label - 1, y = H }
+    x = x - 1
+  end
+
+  -- selection mode: list buttons for the tapped player
+  if selected and nowMs() < selectedUntil then
+    local l = listOf(selected)
+    button("deselect", "[X]", BLACK, RED)
+    button("ignore", "[IGNORE]", BLACK, DIM)
+    button("normal", "[NORMAL]", BLACK, l == nil and BRIGHT or DIM)
+    button("black", "[BLACKLIST]", BLACK, l == "black" and BRIGHT or RED)
+    button("white", "[WHITELIST]", BLACK, l == "white" and BRIGHT or DIM)
+    local k = known[selected]
+    local info = ("%s  %s  visits:%d"):format(selected,
+      l == "black" and "BLACKLISTED" or (l == "white" and "WHITELISTED" or "unlisted"),
+      k and k.visits or 0)
+    put(2, H, fit(info, x - 2), BRIGHT, DARK)
+    return
+  end
+  selected = nil
+
+  -- level picker
+  if nowMs() < levelPickUntil then
+    button("lvlx", "[X]", BLACK, RED)
+    for n = 5, 1, -1 do
+      local on = n == curLevel()
+      button("lvl" .. n, ("[%d %s]"):format(n, LEVELS[n].name), BLACK,
+             on and BRIGHT or (n <= 2 and RED or DIM))
+    end
+    put(2, H, fit("SET BASE LEVEL:", x - 2), BRIGHT, DARK)
+    return
+  end
+
+  local confirming = nowMs() < confirmClearUntil
+  button("clear", confirming and "[ TAP AGAIN ]" or "[ CLEAR LOG ]", BLACK, confirming and BRIGHT or RED)
+  button("next", "[>]")
+  local pg = ("%d/%d"):format(logPage, pageCount)
+  x = x - #pg put(x, H, pg, DIM, DARK) x = x - 1
+  button("prev", "[<]")
+  button("send", "[SEND]", BLACK, BRIGHT)
+  button("radar", "[RADAR]", BLACK, BRIGHT)
+  button("level", ("[LVL %d]"):format(curLevel()), BLACK, curLevel() <= 2 and BRIGHT or RED)
+
+  local info
+  if toast and nowMs() < toastUntil then info = toast
+  elseif lastErr then info = "ERR " .. lastErr
+  elseif botOn() and bot.status ~= "online" and bot.lastError then info = "BOT " .. bot.lastError
+  else
+    local nr = nextReportIn()
+    info = ("LOGGED %d  SEEN %d%s"):format(#log, (function() local c = 0 for _ in pairs(known) do c = c + 1 end return c end)(),
+      nr and ("  REPORT IN " .. fmtDur(nr)) or "")
+  end
+  put(2, H, fit(info, x - 2), lastErr and BRIGHT or DIM, DARK)
+end
+
+local function draw()
+  local w, h = mon.getSize()
+  if type(w) ~= "number" then return end      -- monitor busy/unplugged: skip this frame
+  W, H = w, h
+  rowTargets = {}
+  drawHeader()
+  local top, bottom = 5, H - 2
+  local ph = bottom - top + 1
+  local pw = math.floor(ph * 1.6)
+  if W - pw - 3 >= 56 and ph >= 9 then
+    local listW = W - pw - 3
+    put(1, 4, (" "):rep(listW + 1))
+    drawLists(2, listW, top, bottom)
+    section(listW + 3, top - 1, pw, ("SCOPE  R%d"):format(CFG.radius))
+    drawScope(listW + 3, top, pw, ph)
+  else
+    drawLists(2, W - 2, top - 1, bottom)
+  end
+  bar(H - 1, BLACK)
+  drawFooter()
+end
+
+------------------------------------------------------------------
+-- MAIN
+------------------------------------------------------------------
+load()
+mon.setBackgroundColor(BLACK)
+mon.clear()
+if mon ~= term.current() then
+  term.clear() term.setCursorPos(1, 1)
+  print("GOD'S EYE v2 running on monitor.")
+  print("Radar:    " .. (radarName or "none"))
+  print("Detector: " .. (detectorName or "none"))
+  print("GPU:      " .. (gpuName or "none (radar page off)"))
+  print("Remote:   " .. (CFG.remoteChannel and ("channel " .. CFG.remoteChannel
+    .. (CFG.remoteKey == "" and " (no key set!)" or " (key set)")) or "off"))
+  print("Website:  " .. ((http and CFG.firebaseUrl ~= "" and #CFG.firebaseKey >= 20) and "Firebase sync on"
+    or (CFG.firebaseUrl ~= "" and "firebaseKey must be 20+ characters" or "off")))
+  print("Discord:  " .. (botOn() and "bot (buttons)" or (webhookOn() and "webhook" or "off")))
+  if bot and CFG.botChannel == "" then print("          bot token found, set botChannel!") end
+  print("Time:     " .. fmtT(nowSec(), { date = true, secs = true }) .. " " .. CFG.tzLabel)
+  print("Hold Ctrl+T to stop.")
+end
+
+local pollNow = false            -- set by a remote inject so it shows up without waiting
+
+local function mainLoop()
+  local lastPoll = 0
+  while true do
+    if pollNow or nowMs() - lastPoll >= CFG.pollEvery * 1000 then
+      pollNow = false
+      update(scan())
+      broadcastHud()
+      checkReport()
+      lastPoll = nowMs()
+    end
+    sweep = (sweep + 0.35) % (2 * math.pi)
+    if not (page == "radar" and disp) then draw() end
+    sleep(0.25)
+  end
+end
+
+local LABELS = { white = "whitelisted", black = "blacklisted", ignore = "ignored", normal = "set back to normal" }
+
+-- which: "white" / "black" / "ignore" / "normal".  by = Discord name when changed from Discord
+local function setList(name, which, by, via)
+  lists[name] = which
+  if which == "normal" and not CFG.friends[name] and not CFG.blacklist[name] and not CFG.ignore[name] then
+    lists[name] = nil                  -- nothing to override, just forget
+  end
+  save()
+  local label = LABELS[which] or which
+  toast, toastUntil = (name .. " " .. label .. (by and (" by " .. by) or "")):upper(), nowMs() + 5000
+  if not by and webhookOn() then       -- Discord-made changes are announced by the reply
+    postWebhook({ username = "God's Eye", embeds = { {
+      title = "List change", color = RED_HEX,
+      description = ("`%s` was %s %s at %s %s"):format(name, label, via or "on the monitor", fmtT(nowSec()), CFG.tzLabel),
+    } } }, which ~= "normal" and discord and { discord.row(
+      discord.button("Undo", "ge:normal:" .. name, discord.GREY)) } or nil)
+  end
+  return label
+end
+
+local function levelButtons()
+  if not discord then return nil end
+  local b = {}
+  for n = 1, 5 do
+    b[n] = discord.button(n .. " " .. LEVELS[n].name, "ge:level:" .. n,
+      n <= 2 and discord.RED or (n == 5 and discord.GREEN or discord.GREY))
+  end
+  return { discord.row(table.unpack(b)) }
+end
+
+-- by = Discord name when changed from Discord (that reply announces it)
+local function setLevel(n, by, via)
+  n = math.max(1, math.min(5, math.floor(tonumber(n) or 4)))
+  state.level = n
+  save()
+  toast, toastUntil = ("BASE LEVEL %d %s%s"):format(n, LEVELS[n].name, by and (" BY " .. by:upper()) or ""),
+                      nowMs() + 6000
+  if n <= 2 then alertUntil = nowMs() + 4000 end
+  if speaker then pcall(speaker.playNote, "bell", 2, n <= 2 and 6 or 18) end
+  if not by and webhookOn() then
+    postWebhook({ username = "God's Eye",
+      content = n <= 2 and CFG.blackPing or nil,
+      embeds = { {
+        title = ("BASE LEVEL %d // %s"):format(n, LEVELS[n].name), color = RED_HEX,
+        description = ("**%s** set to level %d " .. (via or "on the monitor") .. " at %s %s"):format(
+          CFG.baseName, n, fmtT(nowSec()), CFG.tzLabel),
+      } } }, levelButtons())
+  end
+end
+
+-- Discord button / menu clicks  (custom_id "ge:<action>[:<name>]")
+local function isAdmin(ix)
+  if ix.userId and CFG.botAdmins[ix.userId] then return true end
+  return CFG.botAdminRole ~= "" and bot:hasRole(ix, CFG.botAdminRole)
+end
+
+if bot then
+  bot:onComponent("ge:", function(ix, rest)
+    local action, name = rest:match("^(%a+):?(.*)$")
+    if action == "test" then
+      bot:reply(ix, ("Buttons work. You are `%s` (ID `%s`)%s."):format(ix.username, tostring(ix.userId),
+        isAdmin(ix) and ", and you're allowed to use them" or ". Add that ID to botAdmins to use them"), true)
+      return
+    end
+    if action == "level" then
+      if not isAdmin(ix) then
+        return bot:reply(ix, ("You can't change the base level. Your Discord ID is `%s`."):format(tostring(ix.userId)), true)
+      end
+      local n = tonumber(name)
+      if not n or n < 1 or n > 5 then return bot:reply(ix, "Pick a level from 1 to 5.", true) end
+      setLevel(n, ix.username)
+      return bot:reply(ix, ("**%s** is now at base level **%d %s** (set by **%s**)."):format(
+        CFG.baseName, n, LEVELS[n].name, ix.username), false, levelButtons())
+    end
+    if not LABELS[action] then return bot:reply(ix, "Unknown action.", true) end
+    if not isAdmin(ix) then
+      return bot:reply(ix, ("You can't change God's Eye lists. Your Discord ID is `%s`; "
+        .. "add it to botAdmins in the config to get access."):format(tostring(ix.userId)), true)
+    end
+    local names = {}
+    if name and name ~= "" then names = { name }
+    elseif type(ix.values) == "table" then names = ix.values end
+    if #names == 0 then return bot:reply(ix, "Nobody selected.", true) end
+
+    for _, n in ipairs(names) do setList(n, action, ix.username) end
+    local who = {}
+    for _, n in ipairs(names) do who[#who + 1] = "`" .. n .. "`" end
+    local undo = nil
+    if #names == 1 and action ~= "normal" then
+      undo = { discord.row(discord.button("Undo", "ge:normal:" .. names[1], discord.GREY)) }
+    end
+    bot:reply(ix, ("%s %s by **%s**."):format(table.concat(who, ", "), LABELS[action], ix.username),
+              false, undo)
+  end)
+end
+
+-- [SEND] button: post a report right now and say whether it worked.
+-- Waits for Discord's answer so errors show on the monitor.
+local function sendReportNow()
+  local function say(msg)
+    toast, toastUntil = msg, nowMs() + 8000
+    print("[SEND] " .. msg)        -- full text on the computer's own screen too
+  end
+  if not http then return say("HTTP IS DISABLED IN THE CC:TWEAKED CONFIG") end
+  if not discord then return say("discord.lua NOT FOUND NEXT TO godseye.lua") end
+  if not bot and CFG.webhookUrl == "" then return say("NO discord.token FILE (AND NO WEBHOOK)") end
+  if bot and CFG.botChannel == "" then return say("SET botChannel IN godseye.cfg") end
+
+  say("SENDING...")
+  local now = nowSec()
+  local since = math.min(state.lastReportT or (now - 3600), now - 3600)
+  local quiet = CFG.quietReports
+  CFG.quietReports = false
+  local payload, names = buildReport(since, now)
+  CFG.quietReports = quiet
+  payload.embeds[1].title = "GOD'S EYE // Manual report for " .. CFG.baseName
+
+  if botOn() then
+    payload.username = nil
+    payload.components = reportMenus(names or {})
+    local res, err = bot:requestSync("POST", "/channels/" .. CFG.botChannel .. "/messages", payload)
+    if res then say("REPORT SENT BY BOT - CHECK DISCORD")
+    else say("BOT SEND FAILED: " .. tostring(err)) end
+  else
+    local h, err, eh = http.post(CFG.webhookUrl, textutils.serializeJSON(payload),
+                                 { ["Content-Type"] = "application/json" })
+    if h then h.close() say("REPORT SENT BY WEBHOOK - CHECK DISCORD")
+    else
+      local detail = eh and eh.readAll() or ""
+      if eh then eh.close() end
+      say("WEBHOOK FAILED: " .. tostring(err) .. " " .. detail)
+    end
+  end
+end
+
+local function onButton(id)
+  if id == "send" then
+    sendReportNow()
+  elseif id == "white" or id == "black" or id == "normal" or id == "ignore" then
+    if selected then setList(selected, id) end
+    selected = nil
+  elseif id == "deselect" then
+    selected = nil
+  elseif id == "level" then
+    levelPickUntil = nowMs() + 15000
+  elseif id == "lvlx" then
+    levelPickUntil = 0
+  elseif id:match("^lvl%d$") then
+    setLevel(tonumber(id:sub(4)))
+    levelPickUntil = 0
+  elseif id == "radar" then
+    if gpu then page = "radar"
+    else toast, toastUntil = "NO DIRECTGPU BLOCK FOUND ON THIS COMPUTER", nowMs() + 6000 end
+  elseif id == "prev" then logPage = math.max(1, logPage - 1)
+  elseif id == "next" then logPage = math.min(pageCount, logPage + 1)
+  elseif id == "clear" then
+    if nowMs() < confirmClearUntil then
+      local keep = {}
+      for _, a in pairs(active) do keep[#keep + 1] = a.entry end
+      log, logPage, confirmClearUntil = keep, 1, 0
+      save()
+    else
+      confirmClearUntil = nowMs() + 3000
+    end
+  end
+end
+
+------------------------------------------------------------------
+-- LIVE WEBSITE  (Firebase Realtime Database relay)
+--   writes  <key>/live  (who's here, ships, level, status)  when it changes
+--           <key>/log   (recent arrivals)                    when it changes
+--           <key>/ack   (result of the last website command)
+--   reads   <key>/commands  (stamps, level changes, send) and deletes them
+------------------------------------------------------------------
+local function webOn()
+  return http ~= nil and CFG.firebaseUrl ~= "" and #CFG.firebaseKey >= 20
+end
+
+local function fbUrl(path)
+  return CFG.firebaseUrl:gsub("/+$", "") .. "/" .. CFG.firebaseKey .. "/" .. path .. ".json"
+end
+
+-- method: "GET", "PUT", "DELETE". Sent as POST + override header (works everywhere).
+local function fb(method, path, body)
+  local req = { url = fbUrl(path), headers = { ["Content-Type"] = "application/json" } }
+  local h, err, eh
+  if method == "GET" then
+    h, err, eh = http.get(req)
+  else
+    req.body = body or "null"
+    req.headers["X-HTTP-Method-Override"] = method
+    h, err, eh = http.post(req)
+  end
+  if not h then
+    local detail = eh and eh.readAll() or ""
+    if eh then eh.close() end
+    webStatus = "error: " .. tostring(err) .. " " .. detail:sub(1, 60)
+    lastErr = "web: " .. tostring(err)
+    return nil
+  end
+  local text = h.readAll()
+  h.close()
+  webStatus = "online"
+  if lastErr and lastErr:find("^web") then lastErr = nil end
+  return text
+end
+
+local function buildLive()
+  local contacts = {}
+  for _, a in pairs(active) do
+    contacts[#contacts + 1] = {
+      name = a.name, x = a.x and math.floor(a.x), y = a.y and math.floor(a.y), z = a.z and math.floor(a.z),
+      dist = a.dist and math.floor(a.dist), dir = compass(a.x, a.z),
+      list = a.black and "black" or (a.friend and "white" or "unknown"),
+      closing = (a.trend and a.trend < -0.3) and true or false,
+      arriveT = a.entry and a.entry.arriveT,
+    }
+  end
+  table.sort(contacts, function(p, q) return (p.dist or 1e9) < (q.dist or 1e9) end)
+  local range = CFG.radarRange or CFG.radius * 1.5
+  local ships = {}
+  for _, sh in ipairs(shipTracks) do
+    local dx, dz = sh.x - CFG.baseX, sh.z - CFG.baseZ
+    if #ships < 24 and dx * dx + dz * dz <= (range * 1.2) ^ 2 then
+      ships[#ships + 1] = { x = math.floor(sh.x), z = math.floor(sh.z) }
+    end
+  end
+  local st, who = threatLevel()
+  return {
+    base = { name = CFG.baseName, x = CFG.baseX, y = CFG.baseY, z = CFG.baseZ,
+             radius = CFG.radius, breach = CFG.breachRadius },
+    range = range, tz = CFG.tzLabel,
+    level = curLevel(), levelName = lvl().name,
+    status = st, statusWho = who or "",
+    link = { radar = radar ~= nil, detector = detectorOk },
+    contacts = contacts, ships = ships,
+  }
+end
+
+local function buildLog()
+  local out = {}
+  for i = 1, math.min(#log, CFG.webLogSize) do
+    local e = log[i]
+    out[#out + 1] = {
+      who = e.name, list = listOf(e.name) or "unknown",
+      arr = e.arriveT and fmtT(e.arriveT) or (e.arrive or "?"),
+      arriveT = e.arriveT,
+      left = e.leaveT and fmtT(e.leaveT) or (e.leave or false),
+      stay = e.stay or false,
+      close = e.closest and (e.closest .. " m " .. (e.dir or "")) or "-",
+    }
+  end
+  return out
+end
+
+local function ack(text)
+  fb("PUT", "ack", textutils.serializeJSON({ text = text, t = nowSec() }))
+end
+
+local function runCommand(c)
+  if type(c) ~= "table" then return end
+  if c.type == "list" and type(c.name) == "string" and c.name ~= "" then
+    local which = ({ white = "white", black = "black", ignore = "ignore", unknown = "normal", normal = "normal" })[c.val]
+    if which then
+      setList(c.name, which, nil, "on the website")
+      ack(("%s %s"):format(c.name:upper(), ({ white = "WHITELISTED", black = "BLACKLISTED",
+        ignore = "IGNORED", normal = "RESET" })[which]))
+    end
+  elseif c.type == "level" and tonumber(c.n) then
+    setLevel(tonumber(c.n), nil, "on the website")
+    ack(("BASE LEVEL %d %s"):format(curLevel(), lvl().name))
+  elseif c.type == "send" then
+    sendReportNow()
+    ack(toast or "REPORT SENT")
+  end
+end
+
+local function webLoop()
+  if not webOn() then
+    while true do sleep(3600) end
+  end
+  local lastLive, lastLiveT, lastLog = "", 0, ""
+  while true do
+    local ok, err = pcall(function()
+      local live = textutils.serializeJSON(buildLive())
+      if live ~= lastLive or nowSec() - lastLiveT >= 30 then
+        -- "t" goes in separately so an unchanged base doesn't count as a change
+        local body = live:sub(1, -2) .. ',"t":' .. nowSec() .. "}"
+        if fb("PUT", "live", body) then lastLive, lastLiveT = live, nowSec() end
+      end
+      local lg = textutils.serializeJSON(buildLog())
+      if lg ~= lastLog then
+        if fb("PUT", "log", lg) then lastLog = lg end
+      end
+      local cmds = fb("GET", "commands")
+      if cmds and cmds ~= "null" then
+        local t = textutils.unserializeJSON(cmds)
+        if type(t) == "table" then
+          for id, c in pairs(t) do
+            fb("DELETE", "commands/" .. id)          -- delete first so it can't run twice
+            runCommand(c)
+          end
+        end
+      end
+    end)
+    if not ok then webStatus = "error: " .. tostring(err) end
+    sleep(CFG.webEvery)
+  end
+end
+
+------------------------------------------------------------------
+-- RADAR PAGE  (top-down scope drawn with CC DirectGPU)
+------------------------------------------------------------------
+local RGB = {
+  bg     = { 6, 0, 1 },
+  scope  = { 20, 2, 4 },
+  grid   = { 64, 7, 11 },
+  bar    = { 40, 4, 6 },
+  dim    = { 140, 42, 46 },
+  red    = { 227, 19, 27 },
+  bright = { 255, 214, 214 },
+  black  = { 0, 0, 0 },
+  ship   = { 125, 125, 135 },
+}
+local FS = 12
+local gpuButtons, lastClick = {}, 0
+local radarFrameMs = 0
+
+local function openDisplay()
+  if not gpu then return false end
+  if disp then return true end
+  local ok, id
+  if CFG.gpuRes then ok, id = pcall(gpu.autoDetectAndCreateDisplayWithResolution, CFG.gpuRes)
+  else ok, id = pcall(gpu.autoDetectAndCreateDisplay) end
+  if not ok or type(id) ~= "number" then
+    lastErr, page = "gpu: " .. tostring(id), "log"
+    return false
+  end
+  local ok2, info = pcall(gpu.getDisplayInfo, id)
+  if not ok2 or type(info) ~= "table" or not info.pixelWidth then
+    pcall(gpu.removeDisplay, id)
+    lastErr, page = "gpu: no display info", "log"
+    return false
+  end
+  disp, dpw, dph = id, info.pixelWidth, info.pixelHeight
+  pcall(gpu.clearEvents, disp)
+  return true
+end
+
+local function closeDisplay()
+  if gpu and disp then pcall(gpu.removeDisplay, disp) end
+  disp = nil
+end
+
+local function fl(v) return math.floor(v + 0.5) end
+local function cw(n, size) return n * (size or FS) * 0.6 end   -- approx monospace width
+local function gtext(s, x, y, c, size, style)
+  pcall(gpu.drawText, disp, s, fl(x), fl(y), c[1], c[2], c[3], CFG.radarFont, fl(size or FS), style or "plain")
+end
+local function gbox(x, y, w, h, c)
+  pcall(gpu.fillRect, disp, fl(x), fl(y), fl(w), fl(h), c[1], c[2], c[3])
+end
+local function gline(x1, y1, x2, y2, c)
+  pcall(gpu.drawLine, disp, fl(x1), fl(y1), fl(x2), fl(y2), c[1], c[2], c[3])
+end
+local function gcircle(x, y, r, c, filled)
+  pcall(gpu.drawCircle, disp, fl(x), fl(y), math.max(1, fl(r)), c[1], c[2], c[3], filled and true or false)
+end
+local function gbutton(id, label, x, y, h, fg, bg)
+  local w = cw(#label) + FS
+  gbox(x, y, w, h, bg)
+  gtext(label, x + FS / 2, y + (h - FS) / 2, fg, FS, "bold")
+  gpuButtons[#gpuButtons + 1] = { id = id, x1 = x, y1 = y, x2 = x + w, y2 = y + h }
+  return x + w + FS * 0.5
+end
+
+local function blipColor(a)
+  if a.black then return RGB.red end
+  if a.friend then return RGB.dim end
+  return lvl().hostileUnknown and RGB.red or RGB.bright
+end
+
+local function drawRadarPage()
+  FS = math.max(10, math.floor(math.min(dpw / 60, dph / 28)))
+  local small = math.max(8, fl(FS * 0.8))
+  local hh, fh = fl(FS * 2.2), fl(FS * 2.4)
+  local now = nowMs()
+  gpuButtons = {}
+  pcall(gpu.clear, disp, RGB.bg[1], RGB.bg[2], RGB.bg[3])
+
+  -- header bar (flashes on alerts, like the text page)
+  local flashing = now < alertUntil and (math.floor(now / 400) % 2 == 0)
+  local hb = flashing and RGB.bright or RGB.red
+  gbox(0, 0, dpw, hh, hb)
+  gtext("<(o)>  GOD'S EYE  //  RADAR", FS * 0.6, (hh - FS) / 2, RGB.black, FS, "bold")
+  local clock = fmtT(nowSec(), { secs = true }) .. " " .. CFG.tzLabel
+  gtext(clock, dpw - cw(#clock) - FS * 0.6, (hh - FS) / 2, RGB.black, FS, "bold")
+
+  -- scope geometry: square on the left, info panel on the right
+  local top, bottom = hh + FS * 0.6, dph - fh - FS * 0.6
+  local panelW = math.max(cw(28), dpw * 0.3)
+  local size = math.max(40, math.min(bottom - top, dpw - panelW - FS * 2))
+  local R = size / 2
+  local cx, cy = FS * 0.8 + R, top + R
+  local range = CFG.radarRange or CFG.radius * 1.5
+  local s = R / range
+
+  gcircle(cx, cy, R, RGB.scope, true)
+  for i = 1, 3 do gcircle(cx, cy, R * i / 4, RGB.grid, false) end
+  gline(cx - R, cy, cx + R, cy, RGB.grid)
+  gline(cx, cy - R, cx, cy + R, RGB.grid)
+
+  -- sweep with a fading trail (time-based so it's smooth at any frame rate)
+  local sweep = (now / 1000 * CFG.sweepSpeed) % (2 * math.pi)
+  for i = 5, 0, -1 do
+    local a = sweep - i * 0.09
+    local t = 1 - i / 6
+    local c = { fl(RGB.grid[1] + (RGB.red[1] - RGB.grid[1]) * t),
+                fl(RGB.grid[2] + (RGB.red[2] - RGB.grid[2]) * t),
+                fl(RGB.grid[3] + (RGB.red[3] - RGB.grid[3]) * t) }
+    gline(cx, cy, cx + math.cos(a) * R, cy + math.sin(a) * R, c)
+  end
+
+  -- zone rings
+  local zr, br = math.min(R, CFG.radius * s), math.min(R, CFG.breachRadius * s)
+  gcircle(cx, cy, zr, RGB.dim, false)
+  gcircle(cx, cy, br, RGB.red, false)
+  gcircle(cx, cy, R, RGB.red, false)
+  gtext("ZONE " .. CFG.radius, cx + 3, cy - zr + 2, RGB.dim, small)
+  gtext("BREACH " .. CFG.breachRadius, cx + 3, cy - br + 2, RGB.red, small)
+  gtext(fl(range) .. "m", cx + R * 0.72, cy + R * 0.72, RGB.dim, small)
+
+  -- compass letters + base marker
+  gtext("N", cx - cw(1, small) / 2, cy - R + 3, RGB.red, small, "bold")
+  gtext("S", cx - cw(1, small) / 2, cy + R - small - 3, RGB.dim, small, "bold")
+  gtext("E", cx + R - cw(1, small) - 4, cy - small / 2, RGB.dim, small, "bold")
+  gtext("W", cx - R + 4, cy - small / 2, RGB.dim, small, "bold")
+  gline(cx - 5, cy, cx + 5, cy, RGB.bright)
+  gline(cx, cy - 5, cx, cy + 5, RGB.bright)
+
+  -- ships / contraptions
+  local shipsIn = 0
+  if CFG.radarShowShips then
+    for _, sh in ipairs(shipTracks) do
+      local dx, dz = (sh.x - CFG.baseX) * s, (sh.z - CFG.baseZ) * s
+      if dx * dx + dz * dz <= R * R then
+        shipsIn = shipsIn + 1
+        local q = math.max(2, FS * 0.25)
+        gbox(cx + dx - q, cy + dz - q, q * 2, q * 2, RGB.ship)
+      end
+    end
+  end
+
+  -- players
+  local list = {}
+  for _, a in pairs(active) do list[#list + 1] = a end
+  table.sort(list, function(p, q) return (p.dist or 1e9) < (q.dist or 1e9) end)
+  local bR = math.max(3, FS * 0.35)
+  for _, a in ipairs(list) do
+    if a.x then
+      local dx, dz = (a.x - CFG.baseX) * s, (a.z - CFG.baseZ) * s
+      local d = math.sqrt(dx * dx + dz * dz)
+      if d > R - bR then dx, dz = dx / d * (R - bR), dz / d * (R - bR) end   -- pin to edge
+      local px, py = cx + dx, cy + dz
+      local c = blipColor(a)
+      if a.black then
+        gcircle(px, py, bR * 2 + (math.floor(now / 250) % 3), RGB.red, false)
+      end
+      if a.trend and a.trend < -0.3 and d > 1 then       -- closing: tail pointing at base
+        gline(px, py, px - dx / d * bR * 3, py - dz / d * bR * 3, RGB.red)
+      end
+      gcircle(px, py, bR, c, not a.friend)
+      gtext(a.name, px + bR + 3, py - small, c, small, "bold")
+      gtext((a.dist and fl(a.dist) .. "m" or "?") .. " " .. compass(a.x, a.z), px + bR + 3, py, RGB.dim, small)
+    end
+  end
+
+  -- right panel
+  local x0 = cx + R + FS * 1.2
+  local pw = dpw - x0 - FS * 0.6
+  local y = top
+  local L = curLevel()
+  gbox(x0, y, pw, FS * 1.8, L <= 2 and RGB.red or RGB.bar)
+  gtext(("LEVEL %d  %s"):format(L, LEVELS[L].name), x0 + FS * 0.5, y + FS * 0.4,
+        L <= 2 and RGB.black or RGB.bright, FS, "bold")
+  y = y + FS * 2.4
+
+  local st, who = threatLevel()
+  local stText = ({ SECURE = "AREA SECURE", CONTACT = "CONTACT", BREACH = "BREACH",
+                    BLACKLIST = "BLACKLISTED", LINK_LOST = "SENSORS OFFLINE" })[st] or st
+  local stCol = st == "SECURE" and RGB.dim or ((st == "CONTACT") and RGB.bright or RGB.red)
+  local blink = (st == "BREACH" or st == "BLACKLIST" or st == "LINK_LOST") and (math.floor(now / 400) % 2 == 1)
+  if not blink then gtext(stText, x0, y, stCol, fl(FS * 1.4), "bold") end
+  y = y + FS * 1.7
+  if who then gtext(who, x0, y, stCol, small) end
+  y = y + FS * 1.4
+
+  gbox(x0, y, pw, FS * 1.4, RGB.bar)
+  gtext(("CONTACTS  %d"):format(#list), x0 + FS * 0.4, y + FS * 0.2, RGB.red, FS, "bold")
+  y = y + FS * 1.8
+  local rows = math.max(1, math.floor((bottom - y - FS * 3) / (FS * 1.3)))
+  if #list == 0 then gtext("no contacts", x0 + FS * 0.4, y, RGB.dim, small) y = y + FS * 1.3 end
+  for i = 1, math.min(#list, rows) do
+    local a = list[i]
+    local c = blipColor(a)
+    gcircle(x0 + FS * 0.5, y + FS * 0.45, math.max(2, FS * 0.25), c, not a.friend)
+    gtext(a.name, x0 + FS * 1.2, y, c, small, "bold")
+    local info = (a.dist and fl(a.dist) .. "m " or "") .. compass(a.x, a.z)
+              .. ((a.trend and a.trend < -0.3) and "  >>" or "")
+    gtext(info, x0 + pw - cw(#info, small), y, RGB.dim, small)
+    y = y + FS * 1.3
+  end
+
+  local foot = ("SHIPS %d   RANGE %dm   FRAME %dms"):format(shipsIn, fl(range), radarFrameMs)
+  gtext(foot, x0, bottom - small, RGB.dim, small)
+
+  -- footer: back button + level buttons
+  local fy = dph - fh
+  gbox(0, fy, dpw, fh, RGB.bar)
+  local bh, by = fh - FS * 0.6, fy + FS * 0.3
+  local bx = gbutton("log", "< LOG", FS * 0.5, by, bh, RGB.black, RGB.bright)
+  bx = bx + FS * 0.5
+  for n = 1, 5 do
+    local on = n == L
+    bx = gbutton("lvl" .. n, n .. " " .. LEVELS[n].name, bx, by, bh,
+                 on and RGB.black or (n <= 2 and RGB.red or RGB.dim),
+                 on and (n <= 2 and RGB.red or RGB.bright) or RGB.bg)
+  end
+  if toast and now < toastUntil and bx + cw(#toast, small) < dpw then
+    gtext(toast, dpw - cw(#toast, small) - FS * 0.5, fy + (fh - small) / 2, RGB.bright, small)
+  end
+end
+
+local function handleGpuClick(x, y)
+  if nowMs() - lastClick < 400 then return end      -- GPU + monitor_touch can both fire
+  for _, b in ipairs(gpuButtons) do
+    if x >= b.x1 and x <= b.x2 and y >= b.y1 and y <= b.y2 then
+      lastClick = nowMs()
+      if b.id == "log" then page = "log"
+      elseif b.id:match("^lvl%d$") then setLevel(tonumber(b.id:sub(4))) end
+      return
+    end
+  end
+end
+
+local function radarLoop()
+  while true do
+    if page == "radar" and gpu then
+      if openDisplay() then
+        local t0 = nowMs()
+        local ok, err = pcall(drawRadarPage)
+        if not ok then lastErr = "radar: " .. tostring(err) end
+        pcall(gpu.updateDisplay, disp)
+        radarFrameMs = nowMs() - t0               -- shown on the radar page
+        for _ = 1, 8 do
+          local okE, e = pcall(gpu.pollEvent, disp)
+          if not okE or type(e) ~= "table" then break end
+          local t = tostring(e.type)
+          if (t == "mouse_click" or t == "click" or t == "mouse_down") and e.x then
+            handleGpuClick(e.x, e.y)
+          end
+        end
+      end
+      sleep(math.max(0.05, 1 / CFG.radarFps - radarFrameMs / 1000))
+    else
+      if disp then closeDisplay() end
+      sleep(0.2)
+    end
+  end
+end
+
+local function eventLoop()
+  while true do
+    local ev, a1, a2, a3, a4 = os.pullEvent()
+    if bot then bot:handleEvent(ev, a1, a2, a3) end
+    if (ev == "monitor_touch" or ev == "mouse_click") and page == "radar" and disp then
+      local mw, mh = mon.getSize()               -- text cell -> GPU pixel
+      if mw then handleGpuClick((a2 - 0.5) / mw * dpw, (a3 - 0.5) / mh * dph) end
+    elseif ev == "monitor_touch" or ev == "mouse_click" then
+      local hit = false
+      for _, b in ipairs(buttons) do
+        if a3 == b.y and a2 >= b.x1 and a2 <= b.x2 then onButton(b.id) hit = true break end
+      end
+      if not hit and rowTargets[a3] and a2 <= listRight then   -- tapped a player row
+        local name = rowTargets[a3]
+        if selected == name then selected = nil
+        else selected, selectedUntil = name, nowMs() + 20000 end
+      end
+    elseif ev == "peripheral" or ev == "peripheral_detach" then
+      radar, radarName = findRadar()
+      detector, detectorName = findDetector()
+      hudModem = findHudModem()
+      openRemote()
+      gpu, gpuName = findGpu()
+      if not gpu then disp, page = nil, "log" end
+    elseif ev == "modem_message" and CFG.remoteChannel and a2 == CFG.remoteChannel then
+      -- a1 = modem side, a3 = reply channel, a4 = packet
+      if type(a4) == "table" and (a4.action == "INJECT_PLAYER" or a4.action == "REMOVE_PLAYER") then
+        local ok, text = handleRemote(a4)
+        if ok then
+          toast, toastUntil = "REMOTE: " .. text, nowMs() + 5000
+          pollNow = true                   -- mainLoop logs + alerts on its next tick
+        end
+        local m = peripheral.wrap(a1)
+        if m and m.transmit and type(a3) == "number" then
+          pcall(m.transmit, a3, CFG.remoteChannel,
+            { action = "INJECT_ACK", ok = ok, name = a4.name, msg = text, base = CFG.baseName })
+        end
+      end
+    elseif ev == "http_success" and a1 == CFG.webhookUrl then
+      a2.close()
+      if lastErr and lastErr:find("^webhook") then lastErr = nil end
+    elseif ev == "http_failure" and a1 == CFG.webhookUrl then
+      lastErr = "webhook: " .. tostring(a2)
+      if a3 then a3.close() end
+    end
+  end
+end
+
+-- auto-restart on crashes (Ctrl+T still stops it)
+while true do
+  local tasks = { mainLoop, eventLoop, radarLoop, webLoop }
+  if bot then tasks[#tasks + 1] = function() bot:run() end end
+  local ok, err = pcall(parallel.waitForAny, table.unpack(tasks))
+  if ok or err == "Terminated" then break end
+  lastErr = "crashed, restarting: " .. tostring(err)
+  pcall(save)
+  print(lastErr)
+  sleep(5)
+end
+
+-- stopped: take the radar picture off the monitor
+if gpu then pcall(gpu.clearAllDisplays) end
